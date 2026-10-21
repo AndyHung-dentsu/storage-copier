@@ -28,20 +28,52 @@ function getDomain(url) {
   }
 }
 
-async function injectContentScript(tabId) {
+// Runs inside the page (isolated world). Must be self-contained.
+function pageStorageHandler(message) {
+  const STORAGE_TYPES = ['sessionStorage', 'localStorage'];
+  const getStorage = (type) =>
+    type === 'sessionStorage' ? window.sessionStorage : window.localStorage;
+
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content.js'],
-    });
-  } catch {
-    // Already injected or restricted page
+    if (message.action === 'read') {
+      const data = {};
+      for (const type of message.types) {
+        if (!STORAGE_TYPES.includes(type)) continue;
+        const storage = getStorage(type);
+        const entries = Object.create(null);
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          entries[key] = storage.getItem(key);
+        }
+        data[type] = { ...entries };
+      }
+      return { success: true, data };
+    }
+
+    if (message.action === 'write') {
+      for (const [type, entries] of Object.entries(message.data)) {
+        if (!STORAGE_TYPES.includes(type)) continue;
+        const storage = getStorage(type);
+        for (const [key, value] of Object.entries(entries)) {
+          storage.setItem(key, value);
+        }
+      }
+      return { success: true };
+    }
+
+    return { success: false, error: `unknown action: ${message.action}` };
+  } catch (err) {
+    return { success: false, error: err?.message || String(err) };
   }
 }
 
 async function sendToTab(tabId, message) {
-  await injectContentScript(tabId);
-  return chrome.tabs.sendMessage(tabId, message);
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pageStorageHandler,
+    args: [message],
+  });
+  return injection?.result;
 }
 
 function getSelectedTypes() {
@@ -135,7 +167,14 @@ async function readCookies(url) {
   }));
 }
 
+/**
+ * Writes cookies to the given url.
+ * @returns {{ written: number, expired: string[], failed: { name: string, reason: string }[] }}
+ */
 async function writeCookies(cookies, url) {
+  const report = { written: 0, expired: [], failed: [] };
+  const nowSec = Date.now() / 1000;
+
   for (const c of cookies) {
     const details = {
       url,
@@ -147,19 +186,31 @@ async function writeCookies(cookies, url) {
       sameSite: c.sameSite || 'lax',
     };
     // domain: use target domain, not source domain
-    // expirationDate: keep if exists, otherwise session cookie
+    // expirationDate: keep if still valid; an expired date would delete the
+    // cookie, so fall back to a session cookie instead (e.g. old memories).
     if (c.expirationDate) {
-      details.expirationDate = c.expirationDate;
+      if (c.expirationDate > nowSec) {
+        details.expirationDate = c.expirationDate;
+      } else {
+        report.expired.push(c.name);
+      }
     }
-    if (c.partitionKey) {
-      details.partitionKey = c.partitionKey;
-    }
+    // partitionKey is intentionally not copied: its topLevelSite belongs to
+    // the source site and is meaningless on the target site.
     try {
-      await chrome.cookies.set(details);
+      const result = await chrome.cookies.set(details);
+      if (result) {
+        report.written++;
+      } else {
+        report.failed.push({ name: c.name, reason: 'rejected by browser' });
+      }
     } catch (err) {
+      report.failed.push({ name: c.name, reason: err?.message || String(err) });
       console.warn(`Failed to set cookie ${c.name}:`, err);
     }
   }
+
+  return report;
 }
 
 // --- Render entries ---
@@ -286,8 +337,31 @@ async function applyDataToCurrentTab(data) {
 
   // Write cookies
   if (normalized.cookies.length) {
-    await writeCookies(normalized.cookies, currentTab.url);
+    return writeCookies(normalized.cookies, currentTab.url);
   }
+  return { written: 0, expired: [], failed: [] };
+}
+
+/**
+ * Shows a toast describing the apply result.
+ * @returns {boolean} true if everything was written successfully
+ */
+function reportApplyResult(report, successMsg) {
+  if (report.failed.length) {
+    const names = report.failed.map((f) => f.name).join(', ');
+    showToast(
+      `${report.failed.length} 筆 cookie 寫入失敗: ${truncate(names, 60)}`,
+      'error',
+    );
+    console.warn('Cookie write failures:', report.failed);
+    return false;
+  }
+  if (report.expired.length) {
+    showToast(`${successMsg}（${report.expired.length} 筆過期 cookie 已改為 session cookie）`);
+    return true;
+  }
+  showToast(successMsg);
+  return true;
 }
 
 // --- Clipboard (paste section) ---
@@ -465,11 +539,12 @@ $('#readBtn').addEventListener('click', async () => {
         action: 'read',
         types: storageTypes,
       });
-      if (res?.success) {
-        Object.assign(entries, res.data);
+      if (!res?.success) {
+        throw new Error(res?.error || 'unknown');
       }
+      Object.assign(entries, res.data);
     } catch (err) {
-      showToast('無法讀取此頁面的 storage', 'error');
+      showToast(`無法讀取此頁面的 storage: ${err.message}`, 'error');
       console.error(err);
       return;
     }
@@ -519,17 +594,20 @@ $('#pasteBtn').addEventListener('click', async () => {
   const clipboard = result[CLIPBOARD_KEY];
   if (!clipboard) return;
 
+  let report;
   try {
-    await applyDataToCurrentTab(clipboard.data);
+    report = await applyDataToCurrentTab(clipboard.data);
   } catch (err) {
     showToast(`寫入失敗: ${err.message}`, 'error');
     console.error(err);
     return;
   }
 
+  // Keep clipboard if anything failed so the user can retry
+  if (!reportApplyResult(report, '已貼上，剪貼簿已清除')) return;
+
   // Clear clipboard after paste
   await chrome.storage.local.remove(CLIPBOARD_KEY);
-  showToast('已貼上，剪貼簿已清除');
   loadClipboard();
 });
 
@@ -548,8 +626,8 @@ $('#applyMemoryBtn').addEventListener('click', async () => {
   if (!memory) return;
 
   try {
-    await applyDataToCurrentTab(memory.data);
-    showToast('已套用記憶');
+    const report = await applyDataToCurrentTab(memory.data);
+    reportApplyResult(report, '已套用記憶');
   } catch (err) {
     showToast(`套用失敗: ${err.message}`, 'error');
     console.error(err);
